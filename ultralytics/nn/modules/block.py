@@ -829,15 +829,19 @@ class SCDown(nn.Module):
 class FDAF(nn.Module):
     """Frequency-Domain Attention Fusion (FDAF) block."""
 
-    def __init__(self, c1, c2):
+    def __init__(self, c1, c2, use_gate=True):
         super().__init__()
         self.conv1 = Conv(c1 * 2, c2, 1, 1)
-        self.gate = nn.Conv2d(c1, c1, 1, 1, 0)
+        self.use_gate = use_gate
+        self.gate = nn.Conv2d(c1, c1, 1, 1, 0) if use_gate else None
 
     def forward(self, x):
         F_x = torch.fft.fft2(x, norm='ortho')
-        mag = torch.abs(F_x)
-        w_gate = torch.sigmoid(self.gate(mag))
-        F_mod = F_x * w_gate
+        if self.gate is None:
+            F_mod = F_x
+        else:
+            mag = torch.abs(F_x)
+            w_gate = torch.sigmoid(self.gate(mag))
+            F_mod = F_x * w_gate
         y_spa = torch.fft.ifft2(F_mod, norm='ortho').real
         return self.conv1(torch.cat([x, y_spa], dim=1)) + x
