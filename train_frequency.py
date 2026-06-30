@@ -45,6 +45,12 @@ def parse_args():
     parser.add_argument("--freq-beta", type=float, default=0.05)
     parser.add_argument("--freq-lambda", type=float, default=1.0)
     parser.add_argument("--freq-roi-size", type=int, default=16)
+    parser.add_argument(
+        "--freq-max-rois",
+        type=int,
+        default=256,
+        help="Maximum positive ROIs sampled for frequency loss per batch. Use 0 to disable the cap.",
+    )
     parser.add_argument("--amp", action="store_true", help="Enable AMP; paper does not specify it")
     parser.add_argument("--cache", action="store_true")
     parser.add_argument("--cos-lr", action="store_true")
@@ -96,7 +102,7 @@ def model_family_params(model_size):
     raise ValueError(f"Unsupported model size: {model_size}")
 
 
-def build_model_config(nc, stage, model_size, freq_beta, freq_lambda, freq_roi_size):
+def build_model_config(nc, stage, model_size, freq_beta, freq_lambda, freq_roi_size, freq_max_rois):
     use_fdaf = stage != "baseline"
     use_gate = stage in {"fdaf_lsg", "full"}
     use_frequency_loss = stage == "full"
@@ -161,6 +167,7 @@ def build_model_config(nc, stage, model_size, freq_beta, freq_lambda, freq_roi_s
         "freq_beta": freq_beta,
         "freq_lambda": freq_lambda,
         "freq_roi_size": freq_roi_size,
+        "freq_max_rois": freq_max_rois,
         "backbone": backbone,
         "head": head,
     }
@@ -224,7 +231,13 @@ def main():
 
     nc = load_dataset_info(data_yaml_path)
     model_cfg = build_model_config(
-        nc, args.stage, args.model_size, args.freq_beta, args.freq_lambda, args.freq_roi_size
+        nc,
+        args.stage,
+        args.model_size,
+        args.freq_beta,
+        args.freq_lambda,
+        args.freq_roi_size,
+        args.freq_max_rois,
     )
     generated_dir = Path("generated_configs")
     generated_dir.mkdir(exist_ok=True)

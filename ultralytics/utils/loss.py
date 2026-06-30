@@ -164,6 +164,7 @@ class v8DetectionLoss:
         self.freq_beta = float(model.yaml.get("freq_beta", 0.05))
         self.freq_lambda = float(model.yaml.get("freq_lambda", 1.0))
         self.freq_roi_size = int(model.yaml.get("freq_roi_size", 16))
+        self.freq_max_rois = int(model.yaml.get("freq_max_rois", 256))
 
         self.use_dfl = m.reg_max > 1
 
@@ -207,6 +208,10 @@ class v8DetectionLoss:
         batch_idx = torch.where(fg_mask)[0][valid].to(pos_pred_bboxes.dtype).unsqueeze(1)
         pred_rois = torch.cat((batch_idx, pos_pred_bboxes[valid]), dim=1)
         target_rois = torch.cat((batch_idx, pos_target_bboxes[valid]), dim=1)
+        if self.freq_max_rois > 0 and pred_rois.shape[0] > self.freq_max_rois:
+            sampled = torch.randperm(pred_rois.shape[0], device=self.device)[: self.freq_max_rois]
+            pred_rois = pred_rois[sampled]
+            target_rois = target_rois[sampled]
 
         roi_size = self.freq_roi_size
         pred_features = roi_align(feats[0], pred_rois, output_size=(roi_size, roi_size), spatial_scale=1.0)
