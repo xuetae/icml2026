@@ -6,6 +6,7 @@ from ultralytics import YOLOv10
 
 
 STAGES = ("baseline", "fdaf", "fdaf_lsg", "full")
+MODEL_SIZES = ("s", "l")
 
 
 def parse_args():
@@ -14,6 +15,12 @@ def parse_args():
     )
     parser.add_argument("--data", required=True, help="Dataset YAML path")
     parser.add_argument("--weights", default="weights/yolov10s.pt")
+    parser.add_argument(
+        "--model-size",
+        choices=MODEL_SIZES,
+        default="s",
+        help="YOLOv10 model size to build. Use 'l' with yolov10l.pt for YOLOv10-L experiments.",
+    )
     parser.add_argument(
         "--stage",
         choices=STAGES,
@@ -69,10 +76,31 @@ def load_dataset_info(data_yaml_path: Path):
     return int(nc)
 
 
-def build_model_config(nc, stage, freq_beta, freq_lambda, freq_roi_size):
+def model_family_params(model_size):
+    if model_size == "s":
+        return {
+            "scales": {"s": [0.33, 0.50, 1024]},
+            "backbone_cib_args": [1024, True, True],
+            "neck_p4_block": "C2f",
+            "neck_p4_args": [512],
+            "neck_p5_args": [1024, True, True],
+        }
+    if model_size == "l":
+        return {
+            "scales": {"l": [1.00, 1.00, 512]},
+            "backbone_cib_args": [1024, True],
+            "neck_p4_block": "C2fCIB",
+            "neck_p4_args": [512, True],
+            "neck_p5_args": [1024, True],
+        }
+    raise ValueError(f"Unsupported model size: {model_size}")
+
+
+def build_model_config(nc, stage, model_size, freq_beta, freq_lambda, freq_roi_size):
     use_fdaf = stage != "baseline"
     use_gate = stage in {"fdaf_lsg", "full"}
     use_frequency_loss = stage == "full"
+    params = model_family_params(model_size)
 
     backbone = [
         [-1, 1, "Conv", [64, 3, 2]],
@@ -83,7 +111,7 @@ def build_model_config(nc, stage, freq_beta, freq_lambda, freq_roi_size):
         [-1, 1, "SCDown", [512, 3, 2]],
         [-1, 6, "C2f", [512, True]],
         [-1, 1, "SCDown", [1024, 3, 2]],
-        [-1, 3, "C2fCIB", [1024, True, True]],
+        [-1, 3, "C2fCIB", params["backbone_cib_args"]],
         [-1, 1, "SPPF", [1024, 5]],
         [-1, 1, "PSA", [1024]],
     ]
@@ -92,18 +120,18 @@ def build_model_config(nc, stage, freq_beta, freq_lambda, freq_roi_size):
         head = [
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
             [[-1, 6], 1, "Concat", [1]],
-            [-1, 3, "C2f", [512]],
+            [-1, 3, params["neck_p4_block"], params["neck_p4_args"]],
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
             [[-1, 4], 1, "Concat", [1]],
             [-1, 3, "C2f", [256]],
             [-1, 1, "FDAF", [256, use_gate]],
             [-1, 1, "Conv", [256, 3, 2]],
             [[-1, 13], 1, "Concat", [1]],
-            [-1, 3, "C2f", [512]],
+            [-1, 3, params["neck_p4_block"], params["neck_p4_args"]],
             [-1, 1, "FDAF", [512, use_gate]],
             [-1, 1, "SCDown", [512, 3, 2]],
             [[-1, 10], 1, "Concat", [1]],
-            [-1, 3, "C2fCIB", [1024, True, True]],
+            [-1, 3, "C2fCIB", params["neck_p5_args"]],
             [-1, 1, "FDAF", [1024, use_gate]],
             [[17, 21, 25], 1, "v10Detect", ["nc"]],
         ]
@@ -111,22 +139,23 @@ def build_model_config(nc, stage, freq_beta, freq_lambda, freq_roi_size):
         head = [
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
             [[-1, 6], 1, "Concat", [1]],
-            [-1, 3, "C2f", [512]],
+            [-1, 3, params["neck_p4_block"], params["neck_p4_args"]],
             [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
             [[-1, 4], 1, "Concat", [1]],
             [-1, 3, "C2f", [256]],
             [-1, 1, "Conv", [256, 3, 2]],
             [[-1, 13], 1, "Concat", [1]],
-            [-1, 3, "C2f", [512]],
+            [-1, 3, params["neck_p4_block"], params["neck_p4_args"]],
             [-1, 1, "SCDown", [512, 3, 2]],
             [[-1, 10], 1, "Concat", [1]],
-            [-1, 3, "C2fCIB", [1024, True, True]],
+            [-1, 3, "C2fCIB", params["neck_p5_args"]],
             [[16, 19, 22], 1, "v10Detect", ["nc"]],
         ]
 
     return {
         "nc": nc,
-        "scales": {"s": [0.33, 0.50, 1024]},
+        "scales": params["scales"],
+        "model_size": model_size,
         "repro_stage": stage,
         "freq_loss_branch": "one2many" if use_frequency_loss else "none",
         "freq_beta": freq_beta,
@@ -195,19 +224,19 @@ def main():
 
     nc = load_dataset_info(data_yaml_path)
     model_cfg = build_model_config(
-        nc, args.stage, args.freq_beta, args.freq_lambda, args.freq_roi_size
+        nc, args.stage, args.model_size, args.freq_beta, args.freq_lambda, args.freq_roi_size
     )
     generated_dir = Path("generated_configs")
     generated_dir.mkdir(exist_ok=True)
-    model_yaml_path = generated_dir / f"yolov10s_{args.stage}.yaml"
+    model_yaml_path = generated_dir / f"yolov10{args.model_size}_{args.stage}.yaml"
     with model_yaml_path.open("w", encoding="utf-8") as file:
         yaml.safe_dump(model_cfg, file, sort_keys=False)
 
-    print(f">>> Building YOLOv10-S stage={args.stage}")
+    print(f">>> Building YOLOv10-{args.model_size.upper()} stage={args.stage}")
     model = YOLOv10(str(model_yaml_path))
     load_pretrained_weights(model, weights_path, args.stage)
 
-    run_name = args.name or f"yolov10s_{args.stage}"
+    run_name = args.name or f"yolov10{args.model_size}_{args.stage}"
     model.train(
         data=str(data_yaml_path),
         epochs=args.epochs,
