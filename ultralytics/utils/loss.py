@@ -147,7 +147,7 @@ class KeypointLoss(nn.Module):
 class v8DetectionLoss:
     """Criterion class for computing training losses."""
 
-    def __init__(self, model, tal_topk=10, use_frequency_loss=False):  # model must be de-paralleled
+    def __init__(self, model, tal_topk=10):  # model must be de-paralleled
         """Initializes v8DetectionLoss with the model, defining model-related properties and BCE loss function."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -160,71 +160,12 @@ class v8DetectionLoss:
         self.no = m.no
         self.reg_max = m.reg_max
         self.device = device
-        self.use_frequency_loss = use_frequency_loss
-        self.freq_beta = float(model.yaml.get("freq_beta", 0.05))
-        self.freq_lambda = float(model.yaml.get("freq_lambda", 1.0))
-        self.freq_roi_size = int(model.yaml.get("freq_roi_size", 16))
-        self.freq_max_rois = int(model.yaml.get("freq_max_rois", 256))
 
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
-
-    def frequency_consistency_loss(self, feats, fg_mask, pred_bboxes, target_bboxes, stride_tensor):
-        """Compute L_freq once, outside the standard YOLO box-loss gain."""
-        from torchvision.ops import roi_align
-
-        # ROIAlign does not optimize ROI coordinates; detach them and train the
-        # sampled feature representations through L_freq.
-        pos_pred_bboxes = pred_bboxes[fg_mask].detach()
-        pos_target_bboxes = target_bboxes[fg_mask].detach()
-
-        batch_size, num_anchors = fg_mask.shape
-        strides = stride_tensor.squeeze(-1).unsqueeze(0).expand(batch_size, num_anchors)
-        pos_strides = strides[fg_mask].unsqueeze(-1)
-
-        # Convert boxes from their anchor-grid units to the P3 feature-map coordinates.
-        pos_pred_bboxes = pos_pred_bboxes * pos_strides / self.stride[0]
-        pos_target_bboxes = pos_target_bboxes * pos_strides / self.stride[0]
-
-        feature_h, feature_w = feats[0].shape[-2:]
-        for boxes in (pos_pred_bboxes, pos_target_bboxes):
-            boxes[:, 0::2].clamp_(0, feature_w)
-            boxes[:, 1::2].clamp_(0, feature_h)
-
-        valid = (
-            torch.isfinite(pos_pred_bboxes).all(1)
-            & torch.isfinite(pos_target_bboxes).all(1)
-            & (pos_pred_bboxes[:, 2] > pos_pred_bboxes[:, 0])
-            & (pos_pred_bboxes[:, 3] > pos_pred_bboxes[:, 1])
-            & (pos_target_bboxes[:, 2] > pos_target_bboxes[:, 0])
-            & (pos_target_bboxes[:, 3] > pos_target_bboxes[:, 1])
-        )
-        if not valid.any():
-            return feats[0].new_zeros(())
-
-        batch_idx = torch.where(fg_mask)[0][valid].to(pos_pred_bboxes.dtype).unsqueeze(1)
-        pred_rois = torch.cat((batch_idx, pos_pred_bboxes[valid]), dim=1)
-        target_rois = torch.cat((batch_idx, pos_target_bboxes[valid]), dim=1)
-        if self.freq_max_rois > 0 and pred_rois.shape[0] > self.freq_max_rois:
-            sampled = torch.randperm(pred_rois.shape[0], device=self.device)[: self.freq_max_rois]
-            pred_rois = pred_rois[sampled]
-            target_rois = target_rois[sampled]
-
-        roi_size = self.freq_roi_size
-        pred_features = roi_align(feats[0], pred_rois, output_size=(roi_size, roi_size), spatial_scale=1.0)
-        target_features = roi_align(feats[0], target_rois, output_size=(roi_size, roi_size), spatial_scale=1.0)
-
-        pred_fft = torch.fft.fft2(pred_features, norm="ortho")
-        target_fft = torch.fft.fft2(target_features, norm="ortho")
-
-        freq_y = torch.fft.fftfreq(roi_size, device=self.device).view(-1, 1)
-        freq_x = torch.fft.fftfreq(roi_size, device=self.device).view(1, -1)
-        radius = torch.sqrt(freq_x.square() + freq_y.square())
-        weights = (1 + self.freq_lambda * radius).view(1, 1, roi_size, roi_size)
-        return (weights * torch.abs(pred_fft - target_fft)).square().mean()
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
@@ -255,7 +196,6 @@ class v8DetectionLoss:
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        frequency_loss = loss.new_zeros(())
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -300,17 +240,53 @@ class v8DetectionLoss:
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
 
-            if self.use_frequency_loss:
-                frequency_loss = self.frequency_consistency_loss(
-                    feats, fg_mask, pred_bboxes, target_bboxes, stride_tensor
-                )
+            # Frequency-Consistency Loss (L_freq)
+            # Extracted from highest-resolution feature map feats[0]
+            from torchvision.ops import roi_align
+            # fg_mask shape: [batch_size, num_anchors]
+            # pred_bboxes shape: [batch_size, num_anchors, 4]
+            # stride_tensor shape: [num_anchors, 1]
+
+            # Use fg_mask to get the positive samples' bounding boxes
+            pos_pred_bboxes = pred_bboxes[fg_mask]
+            pos_target_bboxes = target_bboxes[fg_mask]
+
+            # Since pos_pred_bboxes is 1D now representing flattened valid anchors,
+            # we need to get the corresponding strides.
+            # fg_mask is [B, N], stride_tensor is [N, 1].
+            # We can expand stride_tensor to [B, N] and then apply the mask.
+            batch_size_cur, num_anchors = fg_mask.shape
+            stride_expanded = stride_tensor.squeeze(-1).unsqueeze(0).expand(batch_size_cur, num_anchors)
+            pos_strides = stride_expanded[fg_mask].unsqueeze(-1) # Shape: [num_pos, 1]
+
+            pos_pred_bboxes = pos_pred_bboxes * pos_strides / self.stride[0]
+            pos_target_bboxes = pos_target_bboxes * pos_strides / self.stride[0]
+
+            batch_idx = torch.where(fg_mask)[0]
+            pred_rois = torch.cat([batch_idx.unsqueeze(1).float(), pos_pred_bboxes], dim=1)
+            target_rois = torch.cat([batch_idx.unsqueeze(1).float(), pos_target_bboxes], dim=1)
+
+            P_i = roi_align(feats[0], pred_rois, output_size=(16, 16), spatial_scale=1.0)
+            T_i = roi_align(feats[0], target_rois, output_size=(16, 16), spatial_scale=1.0)
+
+            F_P = torch.fft.fft2(P_i, norm='ortho')
+            F_T = torch.fft.fft2(T_i, norm='ortho')
+
+            H, W = 16, 16
+            freq_y = torch.fft.fftfreq(H, d=1.0).view(-1, 1).repeat(1, W)
+            freq_x = torch.fft.fftfreq(W, d=1.0).view(1, -1).repeat(H, 1)
+            r = torch.sqrt(freq_x**2 + freq_y**2).to(self.device)
+            W_mat = (1 + 1.0 * r).view(1, 1, H, W)
+
+            diff_mag = torch.abs(F_P - F_T)
+            l_freq = (W_mat * diff_mag).pow(2).mean()
+            loss[0] += 0.05 * l_freq
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        total_loss = loss.sum() + self.freq_beta * frequency_loss
-        return total_loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 
 
 class v8SegmentationLoss(v8DetectionLoss):
@@ -782,13 +758,8 @@ class v8OBBLoss(v8DetectionLoss):
 
 class v10DetectLoss:
     def __init__(self, model):
-        branch = model.yaml.get("freq_loss_branch", "none")
-        self.one2many = v8DetectionLoss(
-            model, tal_topk=10, use_frequency_loss=branch in {"one2many", "both"}
-        )
-        self.one2one = v8DetectionLoss(
-            model, tal_topk=1, use_frequency_loss=branch in {"one2one", "both"}
-        )
+        self.one2many = v8DetectionLoss(model, tal_topk=10)
+        self.one2one = v8DetectionLoss(model, tal_topk=1)
     
     def __call__(self, preds, batch):
         one2many = preds["one2many"]
