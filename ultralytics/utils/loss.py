@@ -147,7 +147,7 @@ class KeypointLoss(nn.Module):
 class v8DetectionLoss:
     """Criterion class for computing training losses."""
 
-    def __init__(self, model, tal_topk=10):  # model must be de-paralleled
+    def __init__(self, model, tal_topk=10, use_frequency_loss=True):  # model must be de-paralleled
         """Initializes v8DetectionLoss with the model, defining model-related properties and BCE loss function."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -160,6 +160,7 @@ class v8DetectionLoss:
         self.no = m.no
         self.reg_max = m.reg_max
         self.device = device
+        self.use_frequency_loss = use_frequency_loss
 
         self.use_dfl = m.reg_max > 1
 
@@ -240,47 +241,48 @@ class v8DetectionLoss:
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
 
-            # Frequency-Consistency Loss (L_freq)
-            # Extracted from highest-resolution feature map feats[0]
-            from torchvision.ops import roi_align
-            # fg_mask shape: [batch_size, num_anchors]
-            # pred_bboxes shape: [batch_size, num_anchors, 4]
-            # stride_tensor shape: [num_anchors, 1]
+            if self.use_frequency_loss:
+                # Frequency-Consistency Loss (L_freq)
+                # Extracted from highest-resolution feature map feats[0]
+                from torchvision.ops import roi_align
+                # fg_mask shape: [batch_size, num_anchors]
+                # pred_bboxes shape: [batch_size, num_anchors, 4]
+                # stride_tensor shape: [num_anchors, 1]
 
-            # Use fg_mask to get the positive samples' bounding boxes
-            pos_pred_bboxes = pred_bboxes[fg_mask]
-            pos_target_bboxes = target_bboxes[fg_mask]
+                # Use fg_mask to get the positive samples' bounding boxes
+                pos_pred_bboxes = pred_bboxes[fg_mask]
+                pos_target_bboxes = target_bboxes[fg_mask]
 
-            # Since pos_pred_bboxes is 1D now representing flattened valid anchors,
-            # we need to get the corresponding strides.
-            # fg_mask is [B, N], stride_tensor is [N, 1].
-            # We can expand stride_tensor to [B, N] and then apply the mask.
-            batch_size_cur, num_anchors = fg_mask.shape
-            stride_expanded = stride_tensor.squeeze(-1).unsqueeze(0).expand(batch_size_cur, num_anchors)
-            pos_strides = stride_expanded[fg_mask].unsqueeze(-1) # Shape: [num_pos, 1]
+                # Since pos_pred_bboxes is 1D now representing flattened valid anchors,
+                # we need to get the corresponding strides.
+                # fg_mask is [B, N], stride_tensor is [N, 1].
+                # We can expand stride_tensor to [B, N] and then apply the mask.
+                batch_size_cur, num_anchors = fg_mask.shape
+                stride_expanded = stride_tensor.squeeze(-1).unsqueeze(0).expand(batch_size_cur, num_anchors)
+                pos_strides = stride_expanded[fg_mask].unsqueeze(-1) # Shape: [num_pos, 1]
 
-            pos_pred_bboxes = pos_pred_bboxes * pos_strides / self.stride[0]
-            pos_target_bboxes = pos_target_bboxes * pos_strides / self.stride[0]
+                pos_pred_bboxes = pos_pred_bboxes * pos_strides / self.stride[0]
+                pos_target_bboxes = pos_target_bboxes * pos_strides / self.stride[0]
 
-            batch_idx = torch.where(fg_mask)[0]
-            pred_rois = torch.cat([batch_idx.unsqueeze(1).float(), pos_pred_bboxes], dim=1)
-            target_rois = torch.cat([batch_idx.unsqueeze(1).float(), pos_target_bboxes], dim=1)
+                batch_idx = torch.where(fg_mask)[0]
+                pred_rois = torch.cat([batch_idx.unsqueeze(1).float(), pos_pred_bboxes], dim=1)
+                target_rois = torch.cat([batch_idx.unsqueeze(1).float(), pos_target_bboxes], dim=1)
 
-            P_i = roi_align(feats[0], pred_rois, output_size=(16, 16), spatial_scale=1.0)
-            T_i = roi_align(feats[0], target_rois, output_size=(16, 16), spatial_scale=1.0)
+                P_i = roi_align(feats[0], pred_rois, output_size=(16, 16), spatial_scale=1.0)
+                T_i = roi_align(feats[0], target_rois, output_size=(16, 16), spatial_scale=1.0)
 
-            F_P = torch.fft.fft2(P_i, norm='ortho')
-            F_T = torch.fft.fft2(T_i, norm='ortho')
+                F_P = torch.fft.fft2(P_i, norm='ortho')
+                F_T = torch.fft.fft2(T_i, norm='ortho')
 
-            H, W = 16, 16
-            freq_y = torch.fft.fftfreq(H, d=1.0).view(-1, 1).repeat(1, W)
-            freq_x = torch.fft.fftfreq(W, d=1.0).view(1, -1).repeat(H, 1)
-            r = torch.sqrt(freq_x**2 + freq_y**2).to(self.device)
-            W_mat = (1 + 1.0 * r).view(1, 1, H, W)
+                H, W = 16, 16
+                freq_y = torch.fft.fftfreq(H, d=1.0).view(-1, 1).repeat(1, W)
+                freq_x = torch.fft.fftfreq(W, d=1.0).view(1, -1).repeat(H, 1)
+                r = torch.sqrt(freq_x**2 + freq_y**2).to(self.device)
+                W_mat = (1 + 1.0 * r).view(1, 1, H, W)
 
-            diff_mag = torch.abs(F_P - F_T)
-            l_freq = (W_mat * diff_mag).pow(2).mean()
-            loss[0] += 0.05 * l_freq
+                diff_mag = torch.abs(F_P - F_T)
+                l_freq = (W_mat * diff_mag).pow(2).mean()
+                loss[0] += 0.05 * l_freq
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
@@ -758,8 +760,13 @@ class v8OBBLoss(v8DetectionLoss):
 
 class v10DetectLoss:
     def __init__(self, model):
-        self.one2many = v8DetectionLoss(model, tal_topk=10)
-        self.one2one = v8DetectionLoss(model, tal_topk=1)
+        branch = model.yaml.get("freq_loss_branch", "both")
+        self.one2many = v8DetectionLoss(
+            model, tal_topk=10, use_frequency_loss=branch in {"one2many", "both"}
+        )
+        self.one2one = v8DetectionLoss(
+            model, tal_topk=1, use_frequency_loss=branch in {"one2one", "both"}
+        )
     
     def __call__(self, preds, batch):
         one2many = preds["one2many"]

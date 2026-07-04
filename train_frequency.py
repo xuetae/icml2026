@@ -163,7 +163,7 @@ def build_model_config(nc, stage, model_size, freq_beta, freq_lambda, freq_roi_s
         "scales": params["scales"],
         "model_size": model_size,
         "repro_stage": stage,
-        "freq_loss_branch": "one2many" if use_frequency_loss else "none",
+        "freq_loss_branch": "both" if use_frequency_loss else "none",
         "freq_beta": freq_beta,
         "freq_lambda": freq_lambda,
         "freq_roi_size": freq_roi_size,
