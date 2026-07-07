@@ -164,6 +164,7 @@ class v8DetectionLoss:
         self.freq_beta = float(model.yaml.get("freq_beta", 0.05))
         self.freq_lambda = float(model.yaml.get("freq_lambda", 1.0))
         self.freq_roi_size = int(model.yaml.get("freq_roi_size", 16))
+        self.freq_roi_backend = str(model.yaml.get("freq_roi_backend", "roi_align"))
         self.freq_max_rois = int(model.yaml.get("freq_max_rois", 0))
 
         self.use_dfl = m.reg_max > 1
@@ -178,6 +179,53 @@ class v8DetectionLoss:
             return pred_rois, target_rois
         keep = torch.randperm(pred_rois.shape[0], device=pred_rois.device)[: self.freq_max_rois]
         return pred_rois[keep], target_rois[keep]
+
+    def frequency_roi_pool(self, feats0, rois, roi_size):
+        """Pool frequency-loss ROIs with a backend that can be selected per runtime."""
+        if self.freq_roi_backend == "roi_align":
+            from torchvision.ops import roi_align
+
+            return roi_align(feats0, rois, output_size=(roi_size, roi_size), spatial_scale=1.0)
+
+        if self.freq_roi_backend != "grid_sample":
+            raise ValueError(f"Unsupported freq_roi_backend={self.freq_roi_backend!r}")
+
+        if rois.numel() == 0:
+            return feats0.new_zeros((0, feats0.shape[1], roi_size, roi_size))
+
+        # ROCm-safe fallback for torchvision.ops.roi_align. Coordinates are
+        # treated as fixed proposals, matching roi_align's gradient behavior.
+        rois = rois.detach()
+        _, _, h, w = feats0.shape
+        batch_idx = rois[:, 0].long().clamp_(0, feats0.shape[0] - 1)
+        boxes = rois[:, 1:5].to(dtype=feats0.dtype)
+        x1, y1, x2, y2 = boxes.unbind(1)
+
+        eps = torch.finfo(feats0.dtype).eps
+        x1 = x1.clamp(0, max(w - 1, 0))
+        x2 = x2.clamp(0, max(w - 1, 0))
+        y1 = y1.clamp(0, max(h - 1, 0))
+        y2 = y2.clamp(0, max(h - 1, 0))
+        left, right = torch.minimum(x1, x2), torch.maximum(x1, x2)
+        top, bottom = torch.minimum(y1, y2), torch.maximum(y1, y2)
+        right = torch.maximum(right, left + eps).clamp(max=max(w - 1, 0))
+        bottom = torch.maximum(bottom, top + eps).clamp(max=max(h - 1, 0))
+
+        steps = torch.linspace(
+            0.5 / roi_size,
+            1.0 - 0.5 / roi_size,
+            roi_size,
+            device=feats0.device,
+            dtype=feats0.dtype,
+        )
+        gy, gx = torch.meshgrid(steps, steps, indexing="ij")
+        xs = left[:, None, None] + gx[None] * (right - left)[:, None, None]
+        ys = top[:, None, None] + gy[None] * (bottom - top)[:, None, None]
+        grid_x = (2.0 * xs + 1.0) / max(w, 1) - 1.0
+        grid_y = (2.0 * ys + 1.0) / max(h, 1) - 1.0
+        grid = torch.stack((grid_x, grid_y), dim=-1)
+
+        return F.grid_sample(feats0[batch_idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
@@ -255,7 +303,6 @@ class v8DetectionLoss:
             if self.use_frequency_loss:
                 # Frequency-Consistency Loss (L_freq)
                 # Extracted from highest-resolution feature map feats[0]
-                from torchvision.ops import roi_align
                 # fg_mask shape: [batch_size, num_anchors]
                 # pred_bboxes shape: [batch_size, num_anchors, 4]
                 # stride_tensor shape: [num_anchors, 1]
@@ -281,8 +328,8 @@ class v8DetectionLoss:
                 pred_rois, target_rois = self.sample_frequency_rois(pred_rois, target_rois)
 
                 roi_size = self.freq_roi_size
-                P_i = roi_align(feats[0], pred_rois, output_size=(roi_size, roi_size), spatial_scale=1.0)
-                T_i = roi_align(feats[0], target_rois, output_size=(roi_size, roi_size), spatial_scale=1.0)
+                P_i = self.frequency_roi_pool(feats[0], pred_rois, roi_size)
+                T_i = self.frequency_roi_pool(feats[0], target_rois, roi_size)
 
                 F_P = torch.fft.fft2(P_i, norm='ortho')
                 F_T = torch.fft.fft2(T_i, norm='ortho')

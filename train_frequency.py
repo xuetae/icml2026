@@ -46,6 +46,12 @@ def parse_args():
     parser.add_argument("--freq-lambda", type=float, default=1.0)
     parser.add_argument("--freq-roi-size", type=int, default=16)
     parser.add_argument(
+        "--freq-roi-backend",
+        choices=("roi_align", "grid_sample"),
+        default="roi_align",
+        help="ROI pooling backend for frequency loss. Use grid_sample on ROCm if torchvision roi_align is unstable.",
+    )
+    parser.add_argument(
         "--freq-max-rois",
         type=int,
         default=256,
@@ -102,7 +108,7 @@ def model_family_params(model_size):
     raise ValueError(f"Unsupported model size: {model_size}")
 
 
-def build_model_config(nc, stage, model_size, freq_beta, freq_lambda, freq_roi_size, freq_max_rois):
+def build_model_config(nc, stage, model_size, freq_beta, freq_lambda, freq_roi_size, freq_roi_backend, freq_max_rois):
     use_fdaf = stage != "baseline"
     use_gate = stage in {"fdaf_lsg", "full"}
     use_frequency_loss = stage == "full"
@@ -167,6 +173,7 @@ def build_model_config(nc, stage, model_size, freq_beta, freq_lambda, freq_roi_s
         "freq_beta": freq_beta,
         "freq_lambda": freq_lambda,
         "freq_roi_size": freq_roi_size,
+        "freq_roi_backend": freq_roi_backend,
         "freq_max_rois": freq_max_rois,
         "backbone": backbone,
         "head": head,
@@ -237,6 +244,7 @@ def main():
         args.freq_beta,
         args.freq_lambda,
         args.freq_roi_size,
+        args.freq_roi_backend,
         args.freq_max_rois,
     )
     generated_dir = Path("generated_configs")
