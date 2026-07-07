@@ -161,12 +161,23 @@ class v8DetectionLoss:
         self.reg_max = m.reg_max
         self.device = device
         self.use_frequency_loss = use_frequency_loss
+        self.freq_beta = float(model.yaml.get("freq_beta", 0.05))
+        self.freq_lambda = float(model.yaml.get("freq_lambda", 1.0))
+        self.freq_roi_size = int(model.yaml.get("freq_roi_size", 16))
+        self.freq_max_rois = int(model.yaml.get("freq_max_rois", 0))
 
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+    def sample_frequency_rois(self, pred_rois, target_rois):
+        """Limit frequency-loss ROIs to keep roi_align stable on memory-sensitive backends."""
+        if self.freq_max_rois <= 0 or pred_rois.shape[0] <= self.freq_max_rois:
+            return pred_rois, target_rois
+        keep = torch.randperm(pred_rois.shape[0], device=pred_rois.device)[: self.freq_max_rois]
+        return pred_rois[keep], target_rois[keep]
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
@@ -267,22 +278,24 @@ class v8DetectionLoss:
                 batch_idx = torch.where(fg_mask)[0]
                 pred_rois = torch.cat([batch_idx.unsqueeze(1).float(), pos_pred_bboxes], dim=1)
                 target_rois = torch.cat([batch_idx.unsqueeze(1).float(), pos_target_bboxes], dim=1)
+                pred_rois, target_rois = self.sample_frequency_rois(pred_rois, target_rois)
 
-                P_i = roi_align(feats[0], pred_rois, output_size=(16, 16), spatial_scale=1.0)
-                T_i = roi_align(feats[0], target_rois, output_size=(16, 16), spatial_scale=1.0)
+                roi_size = self.freq_roi_size
+                P_i = roi_align(feats[0], pred_rois, output_size=(roi_size, roi_size), spatial_scale=1.0)
+                T_i = roi_align(feats[0], target_rois, output_size=(roi_size, roi_size), spatial_scale=1.0)
 
                 F_P = torch.fft.fft2(P_i, norm='ortho')
                 F_T = torch.fft.fft2(T_i, norm='ortho')
 
-                H, W = 16, 16
-                freq_y = torch.fft.fftfreq(H, d=1.0).view(-1, 1).repeat(1, W)
-                freq_x = torch.fft.fftfreq(W, d=1.0).view(1, -1).repeat(H, 1)
-                r = torch.sqrt(freq_x**2 + freq_y**2).to(self.device)
-                W_mat = (1 + 1.0 * r).view(1, 1, H, W)
+                H, W = roi_size, roi_size
+                freq_y = torch.fft.fftfreq(H, d=1.0, device=self.device).view(-1, 1).repeat(1, W)
+                freq_x = torch.fft.fftfreq(W, d=1.0, device=self.device).view(1, -1).repeat(H, 1)
+                r = torch.sqrt(freq_x**2 + freq_y**2)
+                W_mat = (1 + self.freq_lambda * r).view(1, 1, H, W)
 
                 diff_mag = torch.abs(F_P - F_T)
                 l_freq = (W_mat * diff_mag).pow(2).mean()
-                loss[0] += 0.05 * l_freq
+                loss[0] += self.freq_beta * l_freq
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
